@@ -3,7 +3,7 @@ Test <- function(object, X = NULL,
                   correction = FALSE, pv.adjust = "BY", n_neighbors = 10, order = "AMMD", 
                   n_threads = 1, cov.model = "exponential", BPPARAM = NULL,  verbose = FALSE ){
   
-  if (!is.null(X)) {
+  if (!is.null(X)) { 
     stopifnot(nrow(X) == ncol(object@gene_expression))
   }
   
