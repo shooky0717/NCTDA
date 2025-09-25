@@ -38,7 +38,7 @@ Test <- function(object, X = NULL,
   # scale coordinates proportionally
   range_all <- max(apply(coords, 2, function(col) diff(range(col))))
   coords <- apply(coords, 2, function(col) (col - min(col)) / range_all)
-  
+  d <- as.matrix(dist(coords))
   # calculate ordering of coordinates
   order_brisc <- BRISC_order(coords, order = order, verbose = verbose)
   
@@ -47,38 +47,40 @@ Test <- function(object, X = NULL,
                              search.type = "tree", ordering = order_brisc, 
                              verbose = verbose)
   
-  # calculate log likelihoods for nonspatial models
   nrows <- nrow(object@gene_expression)
   ncols <- ncol(object@gene_expression)
   
-  loglik_lm <- vapply(seq_len(nrows), function(i) {
+  if (is.null(X)) {
+    X_0 <- rep(1, ncols)
+  }else{
+    X_0 <- X
+  }
+  X_0tX_0 <- crossprod(X_0, X_0)
+  X_0tX_0_inv <- solve(X_0tX_0 + 1e-8 * diag(ncol(X_0tX_0))) 
+  P0tilde <- diag(n) - X_0 %*% X_0tX_0_inv %*% t(X_0)
+  
+  loglik_lm <- vapply(seq_len(nrow(y)), function(i) {
     y_i <- y[i, ]
-    if (is.null(X)) {
-      X_lm <- rep(1, ncols)
-    }else{
-      X_lm <- X
-    }
-    # model formula without intercept to enable weighted model
-    as.numeric(logLik(lm(y_i ~ X_lm - 1)))
-  }, numeric(1))
+    lm_model <- lm(y_i ~ X_0 - 1)  
+    list(
+      loglik = as.numeric(logLik(lm_model)),
+      sigma2 = summary(lm_model)$sigma^2 
+    )
+  }, FUN.VALUE = list(loglik = 0, sigma2 = 0))
+  loglik_lm_mat <- do.call(rbind, loglik_lm)
+  rownames(loglik_lm_mat) <- row_names
   
   #model fit
   
   Test1_result <- lapply(CT_to_test_index, function(i) {
     ct_test <- prop[,i]
     n <- ncols
-    if(is.null(X)){
-      X_0 <- matrix(1, nrow = n, ncol = 1)
-    }else{
-      X_0 <- X
-    }
     X_full <- cbind(X_0, ct_test)
     X_full <- as.matrix(X_full)
     stopifnot(nrow(X_full) == ncol(y))
     
     ix <- seq_len(nrow(y))
     outbrisc_1 <- bplapply(ix, function(j) {
-      # fit model (intercept-only model if x is NULL)
       y_j <- y[j, ]
       suppressWarnings({
         runtime <- system.time({
@@ -88,43 +90,54 @@ Test <- function(object, X = NULL,
                                     verbose = verbose)
         })
       })
-      res_j <- c(
-        out_j$Theta, 
-        loglik_ut = out_j$log_likelihood, 
-        runtime = runtime[["elapsed"]]
+      
+      sigma_sq <- out_j$Theta["sigma.sq"] 
+      tau_sq <- out_j$Theta["tau.sq"]     
+      phi <- out_j$Theta["phi"]           
+      
+      if (cov.model == "exponential") {
+        Sigma_spatial <- sigma_sq * exp(-d / phi)
+      } else if (cov.model == "gaussian") {
+        Sigma_spatial <- sigma_sq * exp(-(d / phi)^2)
+      } else if (cov.model == "matern") {
+        nu <- out_j$Theta["nu"]
+        r <- d / phi
+        Sigma_spatial <- sigma_sq * (2^(1 - nu) / gamma(nu)) * 
+          (r^nu) * besselK(r, nu)
+        diag(Sigma_spatial) <- sigma_sq
+      }
+      
+      sigma2_lm_j <- loglik_lm_mat[gene_name, "sigma2"]
+      P0tilde_Sigma <- P0tilde %*% Sigma_spatial
+      
+      e_j <- sum(diag(P0tilde_Sigma)) / sigma2_lm_j
+      v_j <- sum(diag(P0tilde_Sigma %*% P0tilde_Sigma)) / (sigma2_lm_j^2)
+      
+      a_j <- ifelse(e_j < 1e-8, 1e-8, v_j / (2 * e_j))  
+      g_j <- ifelse(v_j < 1e-8, k+1, (2 * e_j^2) / v_j)  
+      
+      loglik_ut_j <- out_j$log_likelihood  
+      loglik_lm_j <- loglik_lm_mat[gene_name, "loglik"]  
+      LR_stat_j <- -2 * (loglik_lm_j - loglik_ut_j)  
+      
+      pval_j <- ifelse(LR_stat_j < 0, 1, 1 - pchisq(LR_stat_j / a_j, df = g_j))
+      
+      c(
+        loglik_ut = loglik_ut_j, loglik_lm = loglik_lm_j,
+        LR_stat = LR_stat_j, sigma_sq = sigma_sq, tau_sq = tau_sq, phi = phi,
+        pval = pval_j, runtime = runtime[["elapsed"]]
       )
-      res_j
     }, BPPARAM = BPPARAM)
-    matbrisc_1 <- do.call("rbind", outbrisc_1)
-    # calculate statistics
-    # --------------------
     
-    
-    matbrisc_1 <- cbind(
-      matbrisc_1, 
-      loglik_lm = loglik_lm
-    )
-    # calculate LR statistics and tests (Wilks' theorem, asymptotic chi-square
-    # with 2 degrees of freedom)
-    
-    LR_stat <- -2 * (matbrisc_1[, "loglik_lm"] - matbrisc_1[, "loglik_ut"])
-    
-    pval <- 1 - pchisq(LR_stat, df = 2)
-    padj <- p.adjust(pval, method = pv.adjust)
-    
-    
-    
-    output <- data.frame(matbrisc_1,
-                         statistic = LR_stat,
-                         pval = pval,
-                         padj = padj)
-    rownames(output) <- row_names
-    output
+    matbrisc_1 <- do.call(rbind, outbrisc_1)
+    rownames(matbrisc_1) <- row_names
+    matbrisc_1 <- cbind(Test1_df, padj = p.adjust(Test1_df[, "pval"], method = pv.adjust))
+    matbrisc_1  
   })
   names(Test1_result) <- object@cell_types[CT_to_test_index]
   ut_genes_list <- lapply(object@cell_types, function(i) {
     df <- Test1_result[[i]]
-    rows_use <- df[df$padj < 0.01, ]
+    rows_use <- df[df$padj < 0.05, ]
     rownames(rows_use)
   })
   names(ut_genes_list) <- object@cell_types
@@ -136,11 +149,11 @@ Test <- function(object, X = NULL,
     Genes_to_test <- row.names(object@gene_expression)
   }
   Genes_to_test_index <- match(intersect(Genes_to_test, row.names(object@gene_expression)), row.names(object@gene_expression))
-  #if(length(Genes_to_test_index) == 1){
-  #  if(is.na(Genes_to_test_index)) {
-  #    stop("No one in Genes_to_test matches the genes in the object! \n")
-  #  }
-  #} else {
+  if(length(Genes_to_test_index) == 1){
+   if(is.na(Genes_to_test_index)) {
+    stop("No one in Genes_to_test matches the genes in the object! \n")
+  }
+  } else {
   if(all(is.na(Genes_to_test_index))) {
     stop("No one in Genes_to_test matches the genes in the object! \n")
   } else if(any(is.na(Genes_to_test_index))) {
@@ -150,10 +163,9 @@ Test <- function(object, X = NULL,
     cat("The rest will be tested...\n")
     Genes_to_test_index <- na.omit(Genes_to_test_index)
   }
+  }
   
-  ##fit full model
   outbrisc_2 <- bplapply(Genes_to_test_index, function(i) {
-    # fit model (intercept-only model if x is NULL)
     y_i <- y[i, ]
     suppressWarnings({
       runtime <- system.time({
@@ -170,23 +182,16 @@ Test <- function(object, X = NULL,
     )
     res_i
   }, BPPARAM = BPPARAM)
-  
-  # collapse output list into matrix
+
   matbrisc_2 <- do.call("rbind", outbrisc_2)
   
   Test2_result <- lapply(CT_to_test,function(i){
     
     loglik_ut <- Test1_result[[i]]$loglik_ut[Genes_to_test_index]
-    
-    # calculate LR statistics and tests (Wilks' theorem, asymptotic chi-square
-    # with 2 degrees of freedom)
-    
     LR_stat <- -2 * (matbrisc_2[, "loglik_ct"] - loglik_ut)
     
-    pval <- 1 - pchisq(LR_stat, df = 2)
+    pval <- 1 - pchisq(LR_stat, df = 1)
     padj <- p.adjust(pval, method = pv.adjust)
-    
-    # rank SVGs according to LR statistics
     LR_rank <- rank(-1 * LR_stat)
     
     output <- data.frame(matbrisc_2,
